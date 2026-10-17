@@ -1,0 +1,9 @@
+# Not part of the deployed app
+archive-ko/
+test/
+supabase/
+data/
+.claude/
+.env
+.env.*
+*.md

@@ -127,7 +127,34 @@
     }
   })();
 
-  // 소개 페이지의 문의 폼(10분 상담, 지침 템플릿): data-source 로 경로를 구분해 /api/leads 로 보낸다.
+  // 문의 저장: 브라우저가 Supabase(aicheck_leads)에 직접 넣는다. 읽기 권한은 아무에게도 없고,
+  // 도배 제한(IP당 시간당 5건)·같은 이메일 하루 1건·입력 검증은 DB 안의 트리거와 제약이 맡는다.
+  const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
+  const PHONE_RE = /^[0-9+()\-\s]{7,30}$/;
+  async function submitLead({ source, email, companyName, phone, answers, consent }) {
+    const mail = String(email || '').trim().toLowerCase();
+    const company = String(companyName || '').trim();
+    const tel = String(phone || '').trim();
+    if (!consent) throw new Error('Please agree to be contacted so we can process your request.');
+    if (!EMAIL_RE.test(mail)) throw new Error('Please enter a valid email address.');
+    if (company.length > 100 || (source !== 'template' && !company)) throw new Error('Please enter your company name (up to 100 characters).');
+    if (tel && !PHONE_RE.test(tel)) throw new Error('Please enter a valid phone number.');
+    const { error } = await window.sb.from('aicheck_leads').insert({
+      email: mail,
+      company_name: company || '(not provided)',
+      phone: tel || null,
+      answers: source === 'check' ? answers : null,
+      checklist_version: source === 'check' ? window.Checklist.VERSION : null,
+      source,
+      consent_given: true,
+    });
+    if (error) {
+      if (error.message === 'rate_limited') throw new Error('Too many requests. Please try again in a little while.');
+      throw new Error('We could not submit your request. Please check your details and try again.');
+    }
+  }
+
+  // 소개 페이지의 문의 폼(10분 상담, 지침 템플릿): data-source 로 경로를 구분한다.
   document.querySelectorAll('form.lead-form').forEach((form) => {
     const err = form.querySelector('.error');
     const button = form.querySelector('button[type=submit]');
@@ -137,13 +164,7 @@
       const get = (n) => (form.elements[n] ? form.elements[n].value : '');
       button.disabled = true;
       try {
-        const res = await fetch('/api/leads', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source: form.dataset.source, email: get('email'), companyName: get('companyName'), phone: get('phone'), consent: form.elements.consent.checked }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || 'We could not submit your request. Please try again in a little while.');
+        await submitLead({ source: form.dataset.source, email: get('email'), companyName: get('companyName'), phone: get('phone'), consent: form.elements.consent.checked });
         const done = document.createElement('div');
         done.className = 'done';
         const title = document.createElement('h4');
@@ -194,14 +215,11 @@
   const draft = {};
 
   async function start() {
-    try {
-      const res = await fetch('/api/checklist');
-      if (!res.ok) throw new Error();
-      checklist = await res.json();
-    } catch {
-      show(h('p', { class: 'error' }, 'We could not load the questions. Please try again in a little while.'));
-      return;
-    }
+    const C = window.Checklist;
+    checklist = {
+      answers: C.ANSWER_LABELS,
+      areas: C.AREAS.map((a) => ({ id: a.id, name: a.name, questions: C.QUESTIONS.filter((q) => q.area === a.id).map((q) => ({ id: q.id, text: q.text })) })),
+    };
     renderIntro();
   }
 
@@ -263,13 +281,11 @@
     show(h('div', { class: 'qcard center' }, h('p', {}, 'Calculating your score...')));
     let r, service;
     try {
-      const [pr, sr] = await Promise.all([
-        fetch('/api/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answers: draft }) }),
-        fetch('/api/service'),
-      ]);
-      r = await pr.json();
-      if (!pr.ok) throw new Error(r.error || '');
+      const sr = await fetch('/api/service');
+      if (!sr.ok) throw new Error('');
       service = await sr.json();
+      const { overall, grade, label, areas } = window.Checklist.scoreAnswers(draft);
+      r = { overall, grade, label, areas }; // 우선 할 일 Top 3 는 가입 후 리포트에서만 보여준다
     } catch (e) {
       show(h('div', { class: 'qcard center' }, h('p', { class: 'error' }, e.message || 'We could not calculate your score.'), h('button', { class: 'btn ghost', type: 'button', onclick: renderStep }, 'Go back')));
       return;
@@ -306,13 +322,7 @@
         err.textContent = '';
         submit.disabled = true;
         try {
-          const res = await fetch('/api/leads', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: f.email.value, companyName: f.company.value, phone: f.phone.value, answers: draft, consent: f.consent.checked }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data.error || 'We could not submit your request. Please try again in a little while.');
+          await submitLead({ source: 'check', email: f.email.value, companyName: f.company.value, phone: f.phone.value, answers: draft, consent: f.consent.checked });
           formBox.replaceChildren(
             h('h4', {}, 'Your request has been received'),
             h('p', {}, `We will contact you at ${f.email.value}. We will already have your score and weak areas in front of us when we talk.`),

@@ -1,11 +1,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 const { createApp } = require('../src/server');
-const checklist = require('../src/checklist');
+const checklist = require('../public/checklist');
 
+const root = path.join(__dirname, '..');
 const allAnswers = (v) => Object.fromEntries(checklist.QUESTIONS.map((q) => [q.id, v]));
 
-// ── 점수 규칙 ──
+// ── 점수 규칙 (공유 모듈: Node 와 브라우저가 같은 파일을 쓴다) ──
 test('모두 예 → 100점 A, 모두 아니오 → 0점 D, 할 일은 아니오일 때 3개', () => {
   const best = checklist.scoreAnswers(allAnswers(2));
   assert.equal(best.overall, 100);
@@ -33,12 +37,11 @@ test('같은 답변이면 항상 같은 결과 (결정적)', () => {
 
 test('Top 3는 위험 가중치×부족분이 큰 순서, 동점이면 쉬운 것 먼저', () => {
   const a = allAnswers(2);
-  a.t1 = 0; // 3*2=6, effort1
-  a.a1 = 0; // 3*2=6, effort2
-  a.d3 = 0; // 2*2=4
-  a.t5 = 1; // 2*1=2
-  const ids = checklist.scoreAnswers(a).topActions.map((x) => x.questionId);
-  assert.deepEqual(ids, ['t1', 'a1', 'd3']);
+  a.t1 = 0;
+  a.a1 = 0;
+  a.d3 = 0;
+  a.t5 = 1;
+  assert.deepEqual(checklist.scoreAnswers(a).topActions.map((x) => x.questionId), ['t1', 'a1', 'd3']);
 });
 
 test('답변 검증: 누락·범위 밖 값은 거부', () => {
@@ -49,298 +52,152 @@ test('답변 검증: 누락·범위 밖 값은 거부', () => {
   assert.ok(checklist.validateAnswers(null));
 });
 
-// ── API ──
-async function withServer(fn) {
-  const { server, db } = createApp({ dbFile: ':memory:' });
+test('리포트: 4요소(종합·영역별·Top 3·이전 대비 변화)와 면책 문구', () => {
+  const first = { id: 1, created_at: '2026-01-01T00:00:00Z', checklist_version: 1, answers: allAnswers(0) };
+  const second = { id: 2, created_at: '2026-02-01T00:00:00Z', checklist_version: 1, answers: JSON.stringify(allAnswers(1)) }; // 문자열 JSON 도 받는다
+  const r1 = checklist.buildReport(first, null);
+  assert.equal(r1.overall, 0);
+  assert.equal(r1.comparison, null);
+  assert.equal(r1.areas.length, 4);
+  assert.equal(r1.topActions.length, 3);
+  assert.ok(r1.disclaimer.includes('legal'));
+  const r2 = checklist.buildReport(second, first);
+  assert.equal(r2.overall, 50);
+  assert.equal(r2.comparison.overall, 50);
+  assert.equal(r2.comparison.previousId, 1);
+  assert.ok(r2.comparison.areas.every((x) => x.delta === 50));
+});
+
+test('브라우저에서도 같은 파일이 window.Checklist 로 노출된다', () => {
+  const ctx = { window: {} };
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(path.join(root, 'public', 'checklist.js'), 'utf8'), ctx);
+  assert.equal(ctx.window.Checklist.QUESTIONS.length, 20);
+  assert.equal(ctx.window.Checklist.scoreAnswers(allAnswers(2)).overall, 100);
+});
+
+// ── 정적 서버 ──
+async function withServer(fn, opts) {
+  const { server } = createApp(opts);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const client = () => {
-    let cookie = '';
-    return async (path, { method = 'GET', body, headers = {} } = {}) => {
-      const res = await fetch(base + path, {
-        method,
-        headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      const set = res.headers.get('set-cookie');
-      if (set) cookie = set.split(';')[0].endsWith('=') ? '' : set.split(';')[0];
+  try {
+    await fn(async (p, init) => {
+      const res = await fetch(base + p, init);
       const text = await res.text();
       let json = null;
       try { json = JSON.parse(text); } catch {}
-      return { status: res.status, json, text, headers: res.headers };
-    };
-  };
-  try {
-    await fn(client, db);
+      return { status: res.status, text, json, headers: res.headers };
+    });
   } finally {
     server.close();
-    db.close();
   }
 }
 
-const owner = { email: 'Boss@Example.com', password: 'correct horse battery', companyName: '김 회계사무소', employeeCount: 10 };
-
-test('가입·로그인·로그아웃과 회사별 분리', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    assert.equal((await a('/api/me')).status, 401);
-    assert.equal((await a('/api/signup', { method: 'POST', body: owner })).status, 201);
-    const me = await a('/api/me');
-    assert.equal(me.status, 200);
-    assert.equal(me.json.companyName, owner.companyName);
-
-    assert.equal((await a('/api/signup', { method: 'POST', body: owner })).status, 409);
-    assert.equal((await a('/api/signup', { method: 'POST', body: { ...owner, email: 'x@y.com', password: 'short' } })).status, 400);
-
-    await a('/api/logout', { method: 'POST', body: {} });
-    assert.equal((await a('/api/me')).status, 401);
-    const b = client();
-    assert.equal((await b('/api/login', { method: 'POST', body: { email: owner.email, password: 'wrong password' } })).status, 401);
-    assert.equal((await b('/api/login', { method: 'POST', body: { email: 'boss@example.com', password: owner.password } })).status, 200);
-  });
-});
-
-test('진단 저장 → 리포트 4요소 → 재점검 시 변화 표시', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    await a('/api/signup', { method: 'POST', body: owner });
-
-    const first = await a('/api/assessments', { method: 'POST', body: { answers: allAnswers(0) } });
-    assert.equal(first.status, 201);
-    assert.equal(first.json.overall, 0);
-    assert.equal(first.json.grade, 'D');
-    assert.equal(first.json.areas.length, 4);
-    assert.equal(first.json.topActions.length, 3);
-    assert.equal(first.json.comparison, null);
-    assert.ok(first.json.disclaimer.includes('legal'));
-
-    const second = await a('/api/assessments', { method: 'POST', body: { answers: allAnswers(1) } });
-    assert.equal(second.json.overall, 50);
-    assert.equal(second.json.comparison.overall, 50);
-    assert.equal(second.json.comparison.previousId, first.json.id);
-    assert.ok(second.json.comparison.areas.every((x) => x.delta === 50));
-
-    const list = await a('/api/assessments');
-    assert.equal(list.json.length, 2);
-    assert.equal(list.json[0].overall, 50); // 최신이 먼저
-
-    // 이전 기록을 다시 열어도 비교 대상은 그 직전 기록
-    const reopened = await a(`/api/assessments/${first.json.id}`);
-    assert.equal(reopened.json.comparison, null);
-  });
-});
-
-test('다른 회사의 진단은 볼 수 없다', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    const b = client();
-    await a('/api/signup', { method: 'POST', body: owner });
-    await b('/api/signup', { method: 'POST', body: { ...owner, email: 'other@example.com', companyName: '다른 회사' } });
-    const mine = await a('/api/assessments', { method: 'POST', body: { answers: allAnswers(2) } });
-    assert.equal((await b(`/api/assessments/${mine.json.id}`)).status, 404);
-    assert.equal((await b('/api/assessments')).json.length, 0);
-  });
-});
-
-test('로그인 없이는 진단 API 접근 불가, 잘못된 답변은 거부', async () => {
-  await withServer(async (client) => {
-    const anon = client();
-    assert.equal((await anon('/api/assessments')).status, 401);
-    assert.equal((await anon('/api/assessments', { method: 'POST', body: { answers: allAnswers(1) } })).status, 401);
-    const a = client();
-    await a('/api/signup', { method: 'POST', body: owner });
-    assert.equal((await a('/api/assessments', { method: 'POST', body: { answers: { t1: 2 } } })).status, 400);
-    assert.equal((await a('/api/assessments', { method: 'POST', body: { answers: { ...allAnswers(1), t1: 9 } } })).status, 400);
-  });
-});
-
-test('JSON이 아닌 POST는 거부 (CSRF 완화), 정적 파일 경로 이탈 차단', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    const res = await a('/api/login', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: owner });
-    assert.equal(res.status, 415);
-    assert.equal((await a('/')).status, 200);
-    assert.equal((await a('/..%2fsrc%2fserver.js')).status === 200, false);
-    assert.equal((await a('/%2e%2e/package.json')).status === 200, false);
-  });
-});
-
-test('같은 이메일·IP로 로그인 10회 실패하면 제한', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    await a('/api/signup', { method: 'POST', body: owner });
-    const b = client();
-    for (let i = 0; i < 10; i++) assert.equal((await b('/api/login', { method: 'POST', body: { email: owner.email, password: 'nope nope nope' } })).status, 401);
-    assert.equal((await b('/api/login', { method: 'POST', body: { email: owner.email, password: owner.password } })).status, 429);
-  });
-});
-
-// ── 소개 페이지·상담 신청 ──
-test('소개 페이지는 / 에서, 점검 앱은 /app.html 에서 열린다', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    const home = await a('/');
+test('소개 페이지는 /, 점검 앱은 /app.html, 템플릿은 /ai-policy-template.html', async () => {
+  await withServer(async (get) => {
+    const home = await get('/');
     assert.equal(home.status, 200);
     assert.ok(home.text.includes('/app.html#/signup'));
-    assert.ok(!home.text.includes('<script>'), '인라인 스크립트 금지(CSP)');
-    assert.equal((await a('/app.html')).status, 200);
-    const site = await a('/api/site');
-    assert.equal(site.status, 200);
-    assert.deepEqual(Object.keys(site.json).sort(), ['companyName', 'contactEmail', 'contactPhone']);
+    assert.equal((await get('/app.html')).status, 200);
+    const tpl = await get('/ai-policy-template.html');
+    assert.equal(tpl.status, 200);
+    assert.ok(tpl.text.includes('Employee AI Use Policy'));
   });
 });
 
-const consult = (assessmentId, over = {}) => ({
-  assessmentId, topics: ['tools', 'it-support'], phone: '201-555-0100', preferredTime: 'morning', message: '도움이 필요합니다', consent: true, ...over,
-});
-
-test('상담 신청: 동의 필수, 본인 진단만, 진단당 1회, 리포트에 접수 표시', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    const b = client();
-    await a('/api/signup', { method: 'POST', body: owner });
-    await b('/api/signup', { method: 'POST', body: { ...owner, email: 'other@example.com', companyName: '다른 회사' } });
-    const rep = await a('/api/assessments', { method: 'POST', body: { answers: allAnswers(1) } });
-    const id = rep.json.id;
-    assert.equal(rep.json.consultationRequestedAt, null);
-
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id, { consent: false }) })).status, 400);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id, { topics: ['hack'] }) })).status, 400);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id, { preferredTime: 'night' }) })).status, 400);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id, { phone: 'abc' }) })).status, 400);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id, { message: 'x'.repeat(1001) }) })).status, 400);
-    // 다른 회사의 진단으로는 신청할 수 없다
-    assert.equal((await b('/api/consultations', { method: 'POST', body: consult(id) })).status, 404);
-    assert.equal((await client()('/api/consultations', { method: 'POST', body: consult(id) })).status, 401);
-
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id) })).status, 201);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(id) })).status, 409);
-    const again = await a(`/api/assessments/${id}`);
-    assert.ok(again.json.consultationRequestedAt);
-
-    // 새 진단은 다시 신청할 수 있다
-    const rep2 = await a('/api/assessments', { method: 'POST', body: { answers: allAnswers(2) } });
-    assert.equal(rep2.json.consultationRequestedAt, null);
-    assert.equal((await a('/api/consultations', { method: 'POST', body: consult(rep2.json.id, { phone: '', topics: [] }) })).status, 201);
+test('HTML 이 읽는 스크립트는 모두 실제로 서빙되고, 인라인 스크립트는 없다 (CSP)', async () => {
+  await withServer(async (get) => {
+    for (const page of ['/', '/app.html', '/ai-policy-template.html']) {
+      const html = (await get(page)).text;
+      assert.ok(!/<script(?![^>]*\ssrc=)[^>]*>/.test(html), `inline script in ${page}`);
+      for (const [, src] of html.matchAll(/<script[^>]*\ssrc="([^"]+)"/g)) {
+        const res = await get(src);
+        assert.equal(res.status, 200, `${page} loads ${src}`);
+      }
+    }
+    // 스크립트 순서: 설정 → supabase 라이브러리 → 클라이언트 → 점수 규칙 → 화면
+    const app = (await get('/app.html')).text;
+    const order = ['/config.js', '/vendor/supabase.js', '/supabase-client.js', '/checklist.js', '/app.js'].map((s) => app.indexOf(s));
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
   });
 });
 
-test('가입 전 미리보기: 점수만 반환하고 저장하지 않으며 Top 3는 주지 않는다', async () => {
-  await withServer(async (client, db) => {
-    const anon = client();
-    const res = await anon('/api/preview', { method: 'POST', body: { answers: { ...allAnswers(2), t1: 0 } } });
-    assert.equal(res.status, 200);
-    assert.equal(res.json.areas.length, 4);
-    assert.ok(Number.isInteger(res.json.overall));
-    assert.equal(res.json.topActions, undefined);
-    assert.equal(res.json.areas[0].steps, undefined);
-    assert.equal((await anon('/api/preview', { method: 'POST', body: { answers: { t1: 2 } } })).status, 400);
-    assert.equal((await anon('/api/preview', { method: 'POST', body: { answers: { ...allAnswers(2), t1: 5 } } })).status, 400);
-    // 미리보기는 같은 입력이면 같은 점수이고, 저장된 진단 기록이 없다
-    const again = await anon('/api/preview', { method: 'POST', body: { answers: { ...allAnswers(2), t1: 0 } } });
-    assert.deepEqual(again.json, res.json);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM assessments').get().n, 0);
+test('/config.js 는 공개 키만 내려주고, CSP 는 Supabase 와 자기 자신으로만 연결을 허용한다', async () => {
+  await withServer(
+    async (get) => {
+      const cfg = await get('/config.js');
+      assert.equal(cfg.status, 200);
+      assert.ok(cfg.text.startsWith('window.APP_CONFIG = '));
+      assert.ok(cfg.text.includes('https://abc.supabase.co'));
+      assert.ok(cfg.text.includes('sb_publishable_test'));
+      const csp = cfg.headers.get('content-security-policy');
+      assert.match(csp, /connect-src 'self' https:\/\/abc\.supabase\.co/);
+      assert.match(csp, /script-src 'self'/);
+      assert.match(csp, /frame-ancestors 'none'/);
+      assert.equal(cfg.headers.get('x-frame-options'), 'DENY');
+    },
+    { supabase: { url: 'https://abc.supabase.co', publishableKey: 'sb_publishable_test' } }
+  );
+});
+
+test('/api/service 와 /api/site, 없는 API 는 404, 옛 서버 API 는 더 이상 없다', async () => {
+  await withServer(
+    async (get) => {
+      const svc = (await get('/api/service')).json;
+      assert.deepEqual(svc.items.map((i) => i.area).sort(), checklist.AREAS.map((a) => a.id).sort());
+      assert.equal(svc.cybersecurity.length, 6);
+      assert.equal(svc.questions.length, 4);
+      assert.equal(svc.rating, null);
+      assert.deepEqual(svc.testimonials, []);
+      const site = (await get('/api/site')).json;
+      assert.equal(site.companyName, 'Acme');
+      for (const p of ['/api/signup', '/api/login', '/api/leads', '/api/assessments', '/api/preview', '/api/me']) {
+        assert.equal((await get(p)).status, 404, p);
+      }
+    },
+    { site: { companyName: 'Acme' } }
+  );
+});
+
+test('정적 파일 경로 이탈과 POST 는 막는다', async () => {
+  await withServer(async (get) => {
+    assert.notEqual((await get('/..%2fsrc%2fserver.js')).status, 200);
+    assert.notEqual((await get('/%2e%2e/package.json')).status, 200);
+    assert.equal((await get('/', { method: 'POST' })).status, 405);
   });
 });
 
-// ── 관리 서비스 안내와 가입 없는 상담 신청 ──
-const lead = (over = {}) => ({ email: 'Owner@Shop.com', companyName: '동네 약국', phone: '973-555-0100', answers: { ...allAnswers(1), t1: 0 }, consent: true, ...over });
-
-test('서비스 정의는 4개 영역과 1:1로 대응한다', async () => {
-  await withServer(async (client) => {
-    const res = await client()('/api/service');
-    assert.equal(res.status, 200);
-    assert.deepEqual(res.json.items.map((i) => i.area).sort(), checklist.AREAS.map((a) => a.id).sort());
-    assert.ok(res.json.name && res.json.cta);
-  });
+// ── 비밀값이 코드에 섞이지 않았는지 ──
+test('저장소에 서버 비밀값이 없다 (service_role/secret 키, DB 연결 문자열)', () => {
+  const files = [];
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      if (['node_modules', '.git', 'archive-ko', 'data', '.claude'].includes(name)) continue;
+      if (fs.statSync(full).isDirectory()) walk(full);
+      else if (!/package-lock\.json$|vendor[\\/]supabase\.js$/.test(full) && /\.(js|json|html|md|sql|example)$/.test(name)) files.push(full);
+    }
+  };
+  walk(root);
+  const bad = /sb_secret_|service_role"|SERVICE_ROLE_KEY=|postgres(ql)?:\/\/[^\s'"`]*:[^\s'"`@]{6,}@/i;
+  for (const f of files) {
+    if (f === __filename) continue;
+    const text = fs.readFileSync(f, 'utf8');
+    assert.ok(!bad.test(text), `possible secret in ${path.relative(root, f)}`);
+  }
+  // 공개 키는 허용: publishable 형식이어야 한다
+  const cfg = require('../src/supabase-config.json');
+  assert.match(cfg.publishableKey, /^sb_publishable_/);
+  assert.match(cfg.url, /^https:\/\/[a-z0-9]+\.supabase\.co$/);
 });
 
-test('가입 없는 상담 신청: 동의·형식 검증, 점수 포함 저장, 하루 1건 중복 방지', async () => {
-  await withServer(async (client, db) => {
-    const anon = client();
-    const post = (b) => anon('/api/leads', { method: 'POST', body: b });
-    assert.equal((await post(lead({ consent: false }))).status, 400);
-    assert.equal((await post(lead({ email: 'bad' }))).status, 400);
-    assert.equal((await post(lead({ companyName: '' }))).status, 400);
-    assert.equal((await post(lead({ phone: 'abc' }))).status, 400);
-    assert.equal((await post(lead({ answers: { t1: 2 } }))).status, 400);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM leads').get().n, 0);
-
-    assert.equal((await post(lead())).status, 201);
-    assert.equal((await post(lead({ email: 'owner@shop.com' }))).status, 201); // 같은 이메일(대소문자 무시): 성공으로 보이지만 쌓이지 않는다
-    const rows = db.prepare('SELECT * FROM leads').all();
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].email, 'owner@shop.com');
-    assert.equal(JSON.parse(rows[0].answers).t1, 0);
-    assert.ok(rows[0].consent_at);
-  });
-});
-
-test('가입 없는 상담 신청은 IP당 1시간 5건까지', async () => {
-  await withServer(async (client) => {
-    const anon = client();
-    for (let i = 0; i < 5; i++) assert.equal((await anon('/api/leads', { method: 'POST', body: lead({ email: `u${i}@shop.com` }) })).status, 201);
-    assert.equal((await anon('/api/leads', { method: 'POST', body: lead({ email: 'u9@shop.com' }) })).status, 429);
-  });
-});
-
-test('문의 경로: call·template 은 답변 없이 가능, 경로별 중복 방지, 잘못된 source 거부', async () => {
-  await withServer(async (client, db) => {
-    const anon = client();
-    const post = (b) => anon('/api/leads', { method: 'POST', body: b });
-    const base = { email: 'a@shop.com', companyName: '동네 약국', consent: true };
-    assert.equal((await post({ ...base, source: 'hack' })).status, 400);
-    assert.equal((await post({ ...base, source: 'call', companyName: '' })).status, 400); // 상담은 회사 이름 필수
-    assert.equal((await post({ ...base, source: 'call', phone: '973-555-0100' })).status, 201);
-    assert.equal((await post({ ...base, source: 'call' })).status, 201); // 같은 경로 중복: 쌓이지 않음
-    assert.equal((await post({ email: 'a@shop.com', companyName: '', source: 'template', consent: true })).status, 201); // 다른 경로: 쌓임, 회사 이름 선택
-    assert.equal((await post({ ...base, source: 'template', consent: false })).status, 400);
-    const rows = db.prepare('SELECT source, company_name, answers FROM leads ORDER BY id').all();
-    assert.deepEqual(rows.map((r) => r.source), ['call', 'template']);
-    assert.equal(rows[0].answers, null);
-    assert.equal(rows[1].company_name, '(not provided)');
-    // source 를 생략하면 기존처럼 점검 결과 신청(답변 필수)
-    assert.equal((await post({ ...base, email: 'b@shop.com' })).status, 400);
-  });
-});
-
-test('지침 템플릿 페이지와 서비스 정의(구성·증거 자리)', async () => {
-  await withServer(async (client) => {
-    const a = client();
-    const page = await a('/ai-policy-template.html');
-    assert.equal(page.status, 200);
-    assert.ok(page.text.includes('Employee AI Use Policy'));
-    assert.ok(!page.text.includes('<script>'), '인라인 스크립트 금지(CSP)');
-    const svc = (await a('/api/service')).json;
-    assert.equal(svc.suite.length, 4);
-    assert.ok(Array.isArray(svc.testimonials) && Array.isArray(svc.credentials));
-    assert.equal(svc.templateUrl, '/ai-policy-template.html');
-  });
-});
-
-test('고객에게 보이는 화면과 문구는 영어다 (한글 없음)', async () => {
-  const fs = require('node:fs');
-  const path = require('node:path');
+test('고객에게 보이는 화면과 문구는 영어다 (한글 없음)', () => {
   const hangul = /[가-힣]/;
-  const pub = path.join(__dirname, '..', 'public');
   for (const f of ['index.html', 'app.html', 'ai-policy-template.html']) {
-    assert.ok(!hangul.test(fs.readFileSync(path.join(pub, f), 'utf8')), `${f} contains Korean`);
+    assert.ok(!hangul.test(fs.readFileSync(path.join(root, 'public', f), 'utf8')), `${f} contains Korean`);
   }
   const { SERVICE } = require('../src/service');
   assert.ok(!hangul.test(JSON.stringify(SERVICE)), 'service copy contains Korean');
   assert.ok(!hangul.test(JSON.stringify({ AREAS: checklist.AREAS, Q: checklist.QUESTIONS, A: checklist.ANSWER_LABELS })), 'checklist contains Korean');
-  const sample = checklist.scoreAnswers({ ...allAnswers(0) });
-  assert.ok(!hangul.test(JSON.stringify(sample)));
-});
-
-test('사이버보안 구성: 서비스 6가지, 경영자 질문 4개, 업종, 평점 슬롯은 비어 있음', async () => {
-  await withServer(async (client) => {
-    const svc = (await client()('/api/service')).json;
-    assert.equal(svc.cybersecurity.length, 6);
-    assert.equal(svc.questions.length, 4);
-    assert.ok(svc.industries.length >= 5);
-    assert.equal(svc.rating, null);
-    assert.deepEqual(svc.testimonials, []);
-    for (const c of svc.cybersecurity) assert.ok(c.title && c.body);
-  });
 });

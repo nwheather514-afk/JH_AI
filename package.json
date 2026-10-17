@@ -4,11 +4,15 @@
   "private": true,
   "description": "AI security self-check for small businesses",
   "engines": {
-    "node": ">=22.5"
+    "node": "24.x"
   },
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
-    "leads": "node scripts/leads.js"
+    "vendor": "cp node_modules/@supabase/supabase-js/dist/umd/supabase.js public/vendor/supabase.js"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.118.0",
+    "jsdom": "^30.1.3"
   }
 }

@@ -2,3 +2,6 @@ data/
 node_modules/
 .claude/
 .DS_Store
+.env
+.env.*
+!.env.example

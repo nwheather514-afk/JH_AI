@@ -1,6 +1,7 @@
 // Fixed checklist and scoring rules. The same answers always produce the same result.
 // Questions and recommendations restate general principles from NIST AI RMF 1.0 / NIST CSF 2.0 at small-business level.
 
+(function () {
 const VERSION = 1;
 
 // Answer values: 0 = No, 1 = Partly, 2 = Yes
@@ -247,4 +248,26 @@ function compare(current, previous) {
   };
 }
 
-module.exports = { VERSION, AREAS, QUESTIONS, ANSWER_LABELS, validateAnswers, scoreAnswers, compare, riskGrade };
+const DISCLAIMER =
+  'This report is a self-assessment based on general principles of public security frameworks (NIST AI RMF, NIST CSF) and is not legal or security advice. ' +
+  'Confirm actual legal obligations and security measures with an attorney or security professional. Scores are calculated from your answers and do not guarantee your actual security posture.';
+
+// 저장된 진단 한 건(row)과 그 직전 진단(prevRow)으로 리포트를 만든다. row.answers 는 객체 또는 JSON 문자열.
+function buildReport(row, prevRow) {
+  const parse = (a) => (typeof a === 'string' ? JSON.parse(a) : a);
+  const result = scoreAnswers(parse(row.answers));
+  const prev = prevRow ? scoreAnswers(parse(prevRow.answers)) : null;
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    checklistVersion: row.checklist_version,
+    ...result,
+    comparison: prev ? { previousId: prevRow.id, previousCreatedAt: prevRow.created_at, ...compare(result, prev) } : null,
+    disclaimer: DISCLAIMER,
+  };
+}
+
+const api = { VERSION, AREAS, QUESTIONS, ANSWER_LABELS, DISCLAIMER, validateAnswers, scoreAnswers, compare, riskGrade, buildReport };
+if (typeof module !== 'undefined' && module.exports) module.exports = api;
+else window.Checklist = api;
+})();

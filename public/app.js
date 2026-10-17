@@ -1,10 +1,16 @@
 (() => {
   const app = document.getElementById('app');
   const userbar = document.getElementById('userbar');
+  const C = window.Checklist; // 질문·점수 규칙 (checklist.js)
+  const sb = window.sb; // Supabase 클라이언트 (supabase-client.js). 공개 키만 쓰고 접근 제한은 DB 의 RLS 가 맡는다.
   let me = null;
-  let checklist = null;
   let service = null;
   const draft = {}; // 진행 중인 답변 (새로고침 전까지만 유지)
+
+  const checklist = {
+    answers: C.ANSWER_LABELS,
+    areas: C.AREAS.map((a) => ({ id: a.id, name: a.name, questions: C.QUESTIONS.filter((q) => q.area === a.id).map((q) => ({ id: q.id, text: q.text })) })),
+  };
 
   // 사용자 입력은 항상 textContent 로만 넣는다.
   function h(tag, attrs, ...kids) {
@@ -21,19 +27,60 @@
   // replaceChildren 은 배열을 문자열로 바꿔 버리므로 항상 평탄화해서 넘긴다.
   const show = (...nodes) => app.replaceChildren(...nodes.flat());
 
-  async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      method: opts.method || 'GET',
-      headers: opts.body ? { 'Content-Type': 'application/json' } : {},
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const err = new Error(data.error || 'The request failed.');
-      err.status = res.status;
-      throw err;
-    }
+  // ── 데이터 접근 (Supabase) ──
+  class AuthError extends Error {}
+
+  // Supabase 오류를 사용자에게 보여줄 문구로 바꾼다. 세션이 만료됐으면 AuthError.
+  function dbError(error, fallback) {
+    if (error && (error.status === 401 || /jwt|not authenticated/i.test(error.message || ''))) return new AuthError('Please sign in.');
+    if (error && error.code === '23505') return new Error('You have already requested a consultation for this assessment. We will be in touch soon.');
+    return new Error(fallback);
+  }
+
+  async function loadMe() {
+    const { data } = await sb.auth.getSession();
+    const u = data && data.session && data.session.user;
+    if (!u) return null;
+    const meta = u.user_metadata || {};
+    return { email: u.email, companyName: meta.company_name || u.email, employeeCount: meta.employee_count ?? null };
+  }
+
+  function authMessage(error) {
+    const m = String((error && error.message) || '');
+    if (/email not confirmed/i.test(m)) return 'Please confirm your email first. Check your inbox for the confirmation link, then sign in.';
+    if (/invalid login credentials/i.test(m)) return 'Incorrect email or password.';
+    if (/already registered/i.test(m)) return 'That email is already registered. Try signing in.';
+    if (/rate limit/i.test(m)) return 'Too many attempts. Please try again in a little while.';
+    if (/password/i.test(m)) return m;
+    return 'We could not complete that request. Please try again.';
+  }
+
+  async function listRows() {
+    const { data, error } = await sb.from('aicheck_assessments').select('id, checklist_version, answers, created_at').order('id', { ascending: false });
+    if (error) throw dbError(error, 'We could not load your assessments.');
     return data;
+  }
+
+  async function insertAssessment(answers) {
+    const { data, error } = await sb.from('aicheck_assessments').insert({ checklist_version: C.VERSION, answers }).select('id').single();
+    if (error) throw dbError(error, 'We could not save your assessment. Please try again.');
+    return data.id;
+  }
+
+  async function consultationFor(assessmentId) {
+    const { data, error } = await sb.from('aicheck_consultations').select('id, created_at').eq('assessment_id', assessmentId).maybeSingle();
+    if (error) throw dbError(error, 'We could not load your consultation request.');
+    return data;
+  }
+
+  async function getReport(id) {
+    const rows = await listRows(); // 최신순. 직전 진단은 바로 다음 항목이다.
+    const i = rows.findIndex((r) => String(r.id) === String(id));
+    if (i < 0) throw new Error('Assessment not found.');
+    const report = C.buildReport(rows[i], rows[i + 1] || null);
+    const consult = await consultationFor(rows[i].id);
+    report.consultationRequestedAt = consult ? consult.created_at : null;
+    return report;
   }
 
   const fmtDate = (iso) => new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
@@ -59,7 +106,7 @@
       h('button', {
         class: 'ghost',
         onclick: async () => {
-          await api('/api/logout', { method: 'POST', body: {} }).catch(() => {});
+          await sb.auth.signOut().catch(() => {});
           me = null;
           location.hash = '#/';
           route();
@@ -77,18 +124,37 @@
       company: h('input', { type: 'text', id: 'company', maxlength: 100, autocomplete: 'organization' }),
       emp: h('input', { type: 'number', id: 'emp', min: 1, max: 500, inputmode: 'numeric' }),
     };
+    const submit = h('button', { type: 'submit' }, mode === 'signup' ? 'Sign up and start' : 'Sign in');
     const form = h('form', {
       onsubmit: async (e) => {
         e.preventDefault();
         err.textContent = '';
+        submit.disabled = true;
         try {
-          const body = { email: f.email.value, password: f.pw.value };
-          if (mode === 'signup') Object.assign(body, { companyName: f.company.value, employeeCount: f.emp.value });
-          me = await api(mode === 'signup' ? '/api/signup' : '/api/login', { method: 'POST', body });
+          const email = f.email.value.trim().toLowerCase();
+          if (mode === 'signup') {
+            const company = f.company.value.trim();
+            const emp = f.emp.value === '' ? null : Number(f.emp.value);
+            if (!company || company.length > 100) throw new Error('Please enter your company name (up to 100 characters).');
+            if (emp !== null && (!Number.isInteger(emp) || emp < 1 || emp > 500)) throw new Error('Employee count must be a number from 1 to 500.');
+            const { data, error } = await sb.auth.signUp({
+              email,
+              password: f.pw.value,
+              options: { data: { company_name: company, employee_count: emp }, emailRedirectTo: `${location.origin}/app.html` },
+            });
+            if (error) throw new Error(authMessage(error));
+            // 이메일 인증이 켜져 있으면 세션이 없다. 메일의 링크를 누른 뒤 로그인하게 안내한다.
+            if (!data.session) return viewCheckEmail(email);
+          } else {
+            const { error } = await sb.auth.signInWithPassword({ email, password: f.pw.value });
+            if (error) throw new Error(authMessage(error));
+          }
+          me = await loadMe();
           location.hash = '#/';
           route();
         } catch (ex) {
           err.textContent = ex.message;
+          submit.disabled = false;
         }
       },
     },
@@ -99,7 +165,7 @@
         h('label', { for: 'emp' }, 'Number of employees (optional)'), f.emp,
         h('p', { class: 'muted' }, 'We store only your email, company name, employee count (optional), and your answers. We do not collect customer information or AI usage logs.'),
       ] : null,
-      h('div', { class: 'row' }, h('button', { type: 'submit' }, mode === 'signup' ? 'Sign up and start' : 'Sign in')),
+      h('div', { class: 'row' }, submit),
       err
     );
     show(
@@ -113,9 +179,21 @@
     );
   }
 
+  function viewCheckEmail(email) {
+    show(
+      h('h1', {}, 'Check your email'),
+      h('div', { class: 'card' },
+        h('p', {}, `We sent a confirmation link to ${email}. Click it, then come back and sign in. Your answers from the check will be saved to your report when you do.`),
+        h('p', { class: 'muted' }, 'Nothing arrived? Look in your spam folder, or try again in a few minutes.'),
+        h('button', { onclick: () => viewAuth('login') }, 'Go to sign in')
+      )
+    );
+  }
+
   // ── 대시보드 ──
   async function viewHome() {
-    const list = await api('/api/assessments');
+    const rows = await listRows();
+    const list = rows.map((r) => ({ id: r.id, createdAt: r.created_at, ...C.scoreAnswers(r.answers) }));
     const children = [
       h('h1', {}, `${me.companyName} · AI Security Check`),
       h('p', {}, list.length ? 'We recommend re-checking once a month.' : 'No assessments yet. It takes about 10 minutes.'),
@@ -142,7 +220,6 @@
 
   // ── 질문 ──
   async function viewQuiz() {
-    checklist ||= await api('/api/checklist');
     const total = checklist.areas.reduce((n, a) => n + a.questions.length, 0);
     const prog = h('progress', { max: total, value: 0, 'aria-label': 'Progress' });
     const count = h('span', { class: 'muted' });
@@ -177,10 +254,11 @@
       err.textContent = '';
       submit.disabled = true;
       try {
-        const report = await api('/api/assessments', { method: 'POST', body: { answers: draft } });
+        const id = await insertAssessment(draft);
         for (const k of Object.keys(draft)) delete draft[k];
-        location.hash = `#/report/${report.id}`;
+        location.hash = `#/report/${id}`;
       } catch (ex) {
+        if (ex instanceof AuthError) return signedOut();
         err.textContent = ex.message;
         submit.disabled = false;
       }
@@ -197,9 +275,9 @@
     refresh();
   }
 
-
   // ── 상담 신청 카드 ──
   const AREA_BY_PREFIX = { t: 'tools', d: 'data', a: 'access', i: 'incident' };
+  const PHONE_RE = /^[0-9+()\-\s]{7,30}$/;
 
   // Top 3 항목마다 "이 일을 맡아 주는 서비스 항목"을 보여준다.
   function svcLine(action) {
@@ -237,19 +315,21 @@
         err.textContent = '';
         submit.disabled = true;
         try {
-          await api('/api/consultations', {
-            method: 'POST',
-            body: {
-              assessmentId: r.id,
-              topics: topicBoxes.filter((b) => b.input.checked).map((b) => b.t.id),
-              phone: phone.value,
-              preferredTime: time.value,
-              message: msg.value,
-              consent: consent.checked,
-            },
+          if (!consent.checked) throw new Error('Please agree to be contacted so we can process your request.');
+          const tel = phone.value.trim();
+          if (tel && !PHONE_RE.test(tel)) throw new Error('Please enter a valid phone number.');
+          const { error } = await sb.from('aicheck_consultations').insert({
+            assessment_id: r.id,
+            phone: tel || null,
+            preferred_time: time.value,
+            topics: topicBoxes.filter((b) => b.input.checked).map((b) => b.t.id),
+            message: msg.value.trim() || null,
+            consent_given: true,
           });
+          if (error) throw dbError(error, 'We could not submit your request. Please try again.');
           viewReport(r.id);
         } catch (ex) {
+          if (ex instanceof AuthError) return signedOut();
           err.textContent = ex.message;
           submit.disabled = false;
         }
@@ -283,9 +363,12 @@
 
   // ── 리포트 ──
   async function viewReport(id) {
-    checklist ||= await api('/api/checklist');
-    service ||= await api('/api/service');
-    const r = await api(`/api/assessments/${id}`);
+    if (!service) {
+      const res = await fetch('/api/service');
+      if (!res.ok) throw new Error('We could not load the page. Please try again.');
+      service = await res.json();
+    }
+    const r = await getReport(id);
     const cmp = r.comparison;
     const areaDelta = (aid) => (cmp ? cmp.areas.find((a) => a.id === aid)?.delta : null);
 
@@ -340,11 +423,17 @@
       sessionStorage.removeItem('pendingAnswers'); // 실패해도 반복 제출하지 않는다
       if (!raw) return null;
       const saved = JSON.parse(raw);
-      // 오래 전에 남은 답변이 나중에 다른 계정으로 저장되지 않도록 1시간만 유효하다.
-      return saved && saved.answers && Date.now() - saved.savedAt < 60 * 60 * 1000 ? saved.answers : null;
+      // 이메일 인증을 기다리는 시간을 고려해 6시간만 유효하다. 오래 전에 남은 답변이 다른 계정으로 저장되는 일을 막는다.
+      return saved && saved.answers && Date.now() - saved.savedAt < 6 * 60 * 60 * 1000 ? saved.answers : null;
     } catch {
       return null;
     }
+  }
+
+  function signedOut() {
+    me = null;
+    renderUserbar();
+    viewAuth('login');
   }
 
   async function route() {
@@ -352,19 +441,19 @@
     const hash = location.hash || '#/';
     try {
       if (!me) {
-        try { me = await api('/api/me'); } catch (e) { if (e.status !== 401) throw e; }
+        me = await loadMe();
         renderUserbar();
       }
       if (!me) return viewAuth(hash === '#/signup' ? 'signup' : 'login');
       const pending = takePendingAnswers();
-      if (pending) {
+      if (pending && !C.validateAnswers(pending)) {
         try {
-          const rep = await api('/api/assessments', { method: 'POST', body: { answers: pending } });
-          history.replaceState(null, '', `#/report/${rep.id}`);
-          return await viewReport(rep.id);
+          const id = await insertAssessment(pending);
+          history.replaceState(null, '', `#/report/${id}`);
+          return await viewReport(id);
         } catch (e) {
-          if (e.status === 401) throw e; // 아래에서 로그인 화면으로 보낸다
-          /* 답변이 올바르지 않으면 건너뛰고 평소 화면으로 */
+          if (e instanceof AuthError) throw e; // 아래에서 로그인 화면으로 보낸다
+          /* 저장에 실패하면 건너뛰고 평소 화면으로 */
         }
       }
       const m = hash.match(/^#\/report\/(\d+)$/);
@@ -372,10 +461,15 @@
       if (hash === '#/quiz') return await viewQuiz();
       return await viewHome();
     } catch (e) {
-      if (e.status === 401) { me = null; renderUserbar(); return viewAuth('login'); }
+      if (e instanceof AuthError) return signedOut();
       show(h('div', { class: 'card' }, h('p', { class: 'error' }, e.message), h('a', { href: '#/' }, 'Back to start')));
     }
   }
+
+  // 다른 탭에서 로그아웃하거나 세션이 끝나면 로그인 화면으로
+  sb.auth.onAuthStateChange((event) => {
+    if (event === 'SIGNED_OUT' && me) signedOut();
+  });
 
   window.addEventListener('hashchange', route);
   route();
