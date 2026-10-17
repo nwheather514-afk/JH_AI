@@ -1,0 +1,14 @@
+{
+  "name": "ai-security-checkup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "IT 부서 없는 중소기업을 위한 AI 보안 자가진단 서비스",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test",
+    "leads": "node scripts/leads.js"
+  }
+}

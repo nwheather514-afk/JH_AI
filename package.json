@@ -1,0 +1,14 @@
+{
+  "name": "ai-security-checkup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI security self-check for small businesses",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
+    "leads": "node scripts/leads.js"
+  }
+}
